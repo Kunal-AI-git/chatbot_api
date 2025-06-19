@@ -1,10 +1,12 @@
 fastapi
 uvicorn
-requests
 python-dotenv
+requests
+spacy
 sentence-transformers
 faiss-cpu
-spacy
+ollama
+jira
+numpy
+starlette
 pydantic
-httpx
-python-multipart
