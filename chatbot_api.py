@@ -236,30 +236,44 @@ def infer_component_and_issuetype(issue_text):
     return "General", issuetype
 
 # Build prompt for Mistral
-def build_prompt(state):
+def build_prompt(state) -> str:
     context = json.dumps(state["context_history"], indent=2)
     greeted = state.get("greeted", False)
-    return (
+    prompt = (
         "You are a professional, concise support assistant.\n"
         f"{'Start with a polite greeting if this is the first message.' if not greeted else ''}\n"
         "Only ask one thing at a time. Start by asking what problem the user is facing.\n"
         "Do NOT mention priority, component, issue type, or attachments until the problem is clearly described.\n"
-        "If the issue involves visuals, THEN and ONLY THEN ask: 'Would you like to attach any screenshots or links?'\n"
-        "Keep replies short and natural.\n"
-        "**Return a JSON with fields: title, issue, priority, component, issuetype.**\n"
+        "If the issue involves visuals (like UI bugs or webpage errors), THEN and ONLY THEN ask: 'Would you like to attach any screenshots or links?'\n"
+        "Keep replies short (under 2 sentences). Speak naturally.\n"
+        "Avoid bullet points, technical jargon, or long instructions.\n"
+        "Never use 'role' or 'content' in your output — speak as a human.\n"
+        "If the user expresses that a suggested solution didn’t work (in any wording), treat that as a rejection.\n"
+        "After the first rejection, stop showing similar tickets. Ask the user to describe their issue again and treat it as a new request.\n"
+        "Only return the JSON ticket when the user has provided enough real-world detail to raise a support case. This includes: the service provider name (e.g., RedBus), date of booking, date of cancellation, refund method (e.g., UPI), refund amount, and confirmation that the refund is overdue.\n"
+        "DO NOT return the JSON if these details are missing. Ask the user for them first, one at a time, if needed.\n"
+        "Once the user has provided complete details, return ONLY a clean JSON object with fields: title, issue, priority, component, issuetype.\n"
+        "After the JSON, ask: 'Would you like to raise this ticket?'\n"
+        "If the user says yes, then ask for an attachment. This attachment is REQUIRED — it can be a PDF, image, or link. If user refuses, explain it's mandatory.\n"
+        "Once the attachment is provided, respond: 'Ticket created. Thank you.' and do not ask anything else.\n"
         f"\nConversation so far:\n{context}\n"
     )
+    return prompt
+
 
 # Reset ticket state
 def reset_ticket(state):
-    state["context_history"].clear()
+    state["context_history"] = []
+    state["greeted"] = False
     state["ticket_started"] = False
     state["awaiting_attachment"] = False
     state["awaiting_upload_confirmation"] = False
-    state["similar_checked"] = False
     state["awaiting_ticket_confirmation"] = False
     state["awaiting_validation_fix"] = False
+    state["similar_checked"] = False
     state["awaiting_no_similarity_confirmation"] = False
+    state["finalized_ticket"] = None
+    state["jira_response"] = None
     state["pending_fields"] = {
         "title": None,
         "issue": None,
@@ -268,9 +282,8 @@ def reset_ticket(state):
         "issuetype": None,
         "attachments": []
     }
-    state["finalized_ticket"] = None
-    state["jira_response"] = None
     save_conversation_state()
+
 
 # Get valid JIRA issue types
 def get_valid_issue_types(project_key: str) -> List[str]:
@@ -476,372 +489,152 @@ def chat_with_mistral(user_input: str, conversation_id: str):
         init_conversation_state(conversation_id)
         state = conversation_states[conversation_id]
 
-    user_input_lower = user_input.strip().lower()
-    mark_greeted_if_needed(user_input, state)
-    state["context_history"].append({"role": "user", "content": user_input})
-
     ticket_analyzer = TicketAnalysisAgent()
+    user_input_clean = user_input.strip().lower()
 
-    # Handle no similarity confirmation
-    if state["awaiting_no_similarity_confirmation"]:
-        if user_input_lower in ["yes", "create", "y", "please"]:
-            state["awaiting_no_similarity_confirmation"] = False
-            ticket = state["finalized_ticket"]
-            try:
-                jira_response = create_jira_ticket(ticket)
-                state["jira_response"] = jira_response
-                reset_ticket(state)
-                return {
-                    "response": (
-                        f"Created Jira ticket:\n"
-                        f"Jira Key: {jira_response['jira_key']}\n"
-                        f"URL: {jira_response['jira_url']}\n"
-                        f"Ticket ID: {ticket['id']}\n"
-                        f"Status: {jira_response['status']}"
-                    ),
-                    "ticket": ticket,
-                    "jira": jira_response,
-                    "status": "created"
-                }
-            except HTTPException as e:
-                return {
-                    "response": f"Failed to create Jira ticket: {str(e.detail)}",
-                    "ticket": ticket,
-                    "error": str(e.detail),
-                    "status": "error"
-                }
-        elif user_input_lower in ["no", "n"]:
-            state["awaiting_no_similarity_confirmation"] = False
-            reset_ticket(state)
-            return {"response": "Okay, ticket creation cancelled. How else can I assist you?"}
-        else:
-            return {"response": "Please say 'yes' to create the Jira ticket or 'no' to cancel."}
+    # Save user input
+    state["context_history"].append({"role": "user", "content": user_input.strip()})
+    mark_greeted_if_needed(user_input, state)
 
-    # Handle upload confirmation
-    if state["awaiting_upload_confirmation"]:
-        if user_input_lower in ["yes", "done", "y"]:
-            state["awaiting_upload_confirmation"] = False
-            ticket = state["pending_fields"].copy()
-            ticket["id"] = f"TICKET-{hash(conversation_id) % 10000:04}"
-            ticket["description"] = ticket.get("issue", "")
-            state["finalized_ticket"] = ticket
-            save_conversation_state()
-            # Proceed to validation
-            analysis = ticket_analyzer.analyze_ticket(ticket)
-            if analysis["status"] != "success":
-                state["awaiting_validation_fix"] = True
-                guidance = ticket_analyzer.generate_guidance(analysis)
-                guidance_text = "\n".join(guidance["guidance"])
-                return {
-                    "response": f"Ticket validation failed:\n{guidance_text}\nPlease provide the necessary updates.",
-                    "analysis": analysis,
-                    "guidance": guidance
-                }
-            # Proceed to similarity search
-            search_query = f"{ticket['title']} {ticket['issue']}"
-            try:
-                query_embedding = embedding_model.encode([search_query], convert_to_numpy=True)
-                query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=1, keepdims=True)
-                distances, indices = index.search(query_embedding, k=5)
-                similar_tickets = [
-                    {
-                        "ticket": metadata[idx],
-                        "similarity_score": float(distances[0][i])
-                    }
-                    for i, idx in enumerate(indices[0]) if idx < len(metadata) and distances[0][i] > 0.5
-                ]
-                summarized_resolution = ticket_analyzer.summarize_resolutions([t["ticket"] for t in similar_tickets])
-
-                if not similar_tickets:
-                    state["awaiting_no_similarity_confirmation"] = True
-                    save_conversation_state()
-                    return {
-                        "response": "Thanks for explaining. I couldn’t find any similar issues. Would you like me to create a JIRA ticket for this?",
-                        "ticket": ticket,
-                        "status": "awaiting_confirmation"
-                    }
-                else:
-                    state["awaiting_ticket_confirmation"] = True
-                    save_conversation_state()
-                    return {
-                        "response": (
-                            f"Found {len(similar_tickets)} similar tickets:\n"
-                            f"Top match: {similar_tickets[0]['ticket']['title']} (Score: {similar_tickets[0]['similarity_score']:.2f})\n"
-                            f"Resolution: {summarized_resolution}\n"
-                            f"Do you want to proceed with creating a new Jira ticket?"
-                        ),
-                        "similar_tickets": similar_tickets,
-                        "summarized_resolution": summarized_resolution,
-                        "ticket": ticket
-                    }
-            except Exception as e:
-                logger.error(f"Unexpected error during similarity search: {str(e)}")
-                state["awaiting_no_similarity_confirmation"] = True
-                save_conversation_state()
-                return {
-                    "response": "Thanks for explaining. I couldn’t find any similar issues. Would you like me to create a JIRA ticket for this?",
-                    "ticket": ticket,
-                    "status": "awaiting_confirmation"
-                }
-        else:
-            return {"response": "No worries. Let me know once you're done uploading."}
-
-    # Handle validation fixes
-    if state["awaiting_validation_fix"]:
-        # Update ticket fields based on user input
-        if "title" in user_input_lower:
-            state["pending_fields"]["title"] = user_input
-        if "issue" in user_input_lower:
-            state["pending_fields"]["issue"] = user_input
-        if user_input_lower in ["low", "medium", "high", "very high"]:
-            state["pending_fields"]["priority"] = user_input.capitalize()
-        if any(c in user_input_lower for c in ticket_analyzer.valid_components):
-            state["pending_fields"]["component"] = user_input.capitalize()
-
-        ticket = state["pending_fields"].copy()
-        ticket["id"] = f"TICKET-{hash(conversation_id) % 10000:04}"
-        ticket["description"] = ticket.get("issue", "")
-        state["finalized_ticket"] = ticket
-        analysis = ticket_analyzer.analyze_ticket(ticket)
-        if analysis["status"] != "success":
-            guidance = ticket_analyzer.generate_guidance(analysis)
-            guidance_text = "\n".join(guidance["guidance"])
-            return {
-                "response": f"Ticket validation still incomplete:\n{guidance_text}\nPlease provide the necessary updates.",
-                "analysis": analysis,
-                "guidance": guidance
-            }
-        state["awaiting_validation_fix"] = False
-        save_conversation_state()
-        # Proceed to similarity search
-        search_query = f"{ticket['title']} {ticket['issue']}"
-        try:
-            query_embedding = embedding_model.encode([search_query], convert_to_numpy=True)
-            query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=1, keepdims=True)
-            distances, indices = index.search(query_embedding, k=5)
-            similar_tickets = [
-                {
-                    "ticket": metadata[idx],
-                    "similarity_score": float(distances[0][i])
-                }
-                for i, idx in enumerate(indices[0]) if idx < len(metadata) and distances[0][i] > 0.5
-            ]
-            summarized_resolution = ticket_analyzer.summarize_resolutions([t["ticket"] for t in similar_tickets])
-
-            if not similar_tickets:
-                state["awaiting_no_similarity_confirmation"] = True
-                save_conversation_state()
-                return {
-                    "response": "Thanks for explaining. I couldn’t find any similar issues. Would you like me to create a JIRA ticket for this?",
-                    "ticket": ticket,
-                    "status": "awaiting_confirmation"
-                }
-            else:
-                state["awaiting_ticket_confirmation"] = True
-                save_conversation_state()
-                return {
-                    "response": (
-                        f"Found {len(similar_tickets)} similar tickets:\n"
-                        f"Top match: {similar_tickets[0]['ticket']['title']} (Score: {similar_tickets[0]['similarity_score']:.2f})\n"
-                        f"Resolution: {summarized_resolution}\n"
-                        f"Do you want to proceed with creating a new Jira ticket?"
-                    ),
-                    "similar_tickets": similar_tickets,
-                    "summarized_resolution": summarized_resolution,
-                    "ticket": ticket
-                }
-        except Exception as e:
-            logger.error(f"Unexpected error during similarity search: {str(e)}")
-            state["awaiting_no_similarity_confirmation"] = True
-            save_conversation_state()
-            return {
-                "response": "Thanks for explaining. I couldn’t find any similar issues. Would you like me to create a JIRA ticket for this?",
-                "ticket": ticket,
-                "status": "awaiting_confirmation"
-            }
-
-    # Handle initial greeting
-    if not state["ticket_started"] and not state["pending_fields"]["issue"]:
-        if re.match(r"^\s*(hi+|hello+|hey+|good (morning|afternoon|evening))\s*[.!]*$", user_input_lower):
-            return {"response": "Hi! How can I assist you today?"}
-        else:
-            state["ticket_started"] = True
-            save_conversation_state()
-            return {"response": "Could you please describe the issue you're facing in detail?"}
-
-    # Handle issue description
-    if state["ticket_started"] and not state["pending_fields"]["issue"]:
-        state["pending_fields"]["issue"] = user_input
-        state["pending_fields"]["title"] = user_input[:50]
-        similar = search_similar_tickets(user_input)
-        state["similar_checked"] = True
-        if similar and similar[0]["score"] > 0.5:
-            top = similar[0]["ticket"]
-            state["awaiting_ticket_confirmation"] = True
+    # --- SIMILARITY CHECK FIRST TIME ONLY ---
+    if not state["similar_checked"] and not state["finalized_ticket"]:
+        results = search_similar_tickets(user_input)
+        if results and results[0]["score"] > 0.75:
+            top = results[0]["ticket"]
+            state["similar_checked"] = True
+            summarized = ticket_analyzer.summarize_resolutions([top])
+            state["context_history"].append({
+                "role": "assistant",
+                "content": (
+                    f"I found a similar issue:\n- Title: {top.get('title')}\n"
+                    f"- Issue: {top.get('issue')}\n- Resolution: {top.get('resolution', 'No resolution available')}"
+                )
+            })
             save_conversation_state()
             return {
                 "response": (
-                    f"I found a similar issue:\n- Title: {top.get('title')}\n- Description: {top.get('issue')}\n- Resolution: {top.get('resolution', 'No resolution available')}\n\nDo you want to proceed with creating a new Jira ticket?"
+                    f"I found a similar issue:\n- Title: {top.get('title')}\n"
+                    f"- Issue: {top.get('issue')}\n- Resolution: {top.get('resolution', 'No resolution available')}\n\n"
+                    "If this doesn't solve your issue, please describe your problem again."
                 ),
-                "similar_tickets": [{"ticket": top, "similarity_score": similar[0]["score"]}],
-                "summarized_resolution": ticket_analyzer.summarize_resolutions([top])
+                "status": "suggestion"
             }
-        else:
-            c, t = infer_component_and_issuetype(state["pending_fields"]["issue"])
-            state["pending_fields"]["component"] = c
-            state["pending_fields"]["issuetype"] = t
-            save_conversation_state()
-            return {"response": "Thanks for explaining. What priority would you like to assign to this issue? (Low, Medium, High)"}
 
-    # Handle ticket creation confirmation
-    if state["awaiting_ticket_confirmation"]:
-        if user_input_lower in ["yes", "create", "y", "please"]:
-            state["awaiting_ticket_confirmation"] = False
-            ticket = state["finalized_ticket"] or state["pending_fields"].copy()
-            ticket["id"] = f"TICKET-{hash(conversation_id) % 10000:04}"
-            ticket["description"] = ticket.get("issue", "")
-            state["finalized_ticket"] = ticket
-            analysis = ticket_analyzer.analyze_ticket(ticket)
-            if analysis["status"] != "success":
-                state["awaiting_validation_fix"] = True
-                guidance = ticket_analyzer.generate_guidance(analysis)
-                guidance_text = "\n".join(guidance["guidance"])
-                return {
-                    "response": f"Ticket validation failed:\n{guidance_text}\nPlease provide the necessary updates.",
-                    "analysis": analysis,
-                    "guidance": guidance
-                }
-            # Proceed to create Jira ticket
-            try:
-                jira_response = create_jira_ticket(ticket)
-                state["jira_response"] = jira_response
-                reset_ticket(state)
-                return {
-                    "response": (
-                        f"Created Jira ticket:\n"
-                        f"Jira Key: {jira_response['jira_key']}\n"
-                        f"URL: {jira_response['jira_url']}\n"
-                        f"Ticket ID: {ticket['id']}\n"
-                        f"Status: {jira_response['status']}"
-                    ),
-                    "ticket": ticket,
-                    "jira": jira_response,
-                    "status": "created"
-                }
-            except HTTPException as e:
-                return {
-                    "response": f"Failed to create Jira ticket: {str(e.detail)}",
-                    "ticket": ticket,
-                    "error": str(e.detail),
-                    "status": "error"
-                }
-        elif user_input_lower in ["no", "n"]:
-            state["awaiting_ticket_confirmation"] = False
-            reset_ticket(state)
-            return {"response": "Okay, ticket creation cancelled. How else can I assist you?"}
-        else:
-            return {"response": "Please say 'yes' to proceed with creating the Jira ticket or 'no' to cancel."}
-
-    # Handle priority selection
-    if state["pending_fields"]["issue"] and not state["pending_fields"]["priority"]:
-        if user_input_lower in ["low", "medium", "high"]:
-            state["pending_fields"]["priority"] = user_input.capitalize()
-            state["awaiting_attachment"] = True
-            save_conversation_state()
-            return {"response": "Would you like to attach any screenshot, PDF, or link related to the issue?"}
-        else:
-            return {"response": "Please specify a valid priority: Low, Medium, or High."}
-
-    # Handle attachment prompt
-    if state["awaiting_attachment"]:
-        if user_input_lower in ["no", "n"]:
-            state["awaiting_attachment"] = False
-            ticket = state["pending_fields"].copy()
-            ticket["id"] = f"TICKET-{hash(conversation_id) % 10000:04}"
-            ticket["description"] = ticket.get("issue", "")
-            state["finalized_ticket"] = ticket
-            save_conversation_state()
-            # Validate ticket
-            analysis = ticket_analyzer.analyze_ticket(ticket)
-            if analysis["status"] != "success":
-                state["awaiting_validation_fix"] = True
-                guidance = ticket_analyzer.generate_guidance(analysis)
-                guidance_text = "\n".join(guidance["guidance"])
-                return {
-                    "response": f"Ticket validation failed:\n{guidance_text}\nPlease provide the necessary updates.",
-                    "analysis": analysis,
-                    "guidance": guidance
-                }
-            # Perform similarity search
-            search_query = f"{ticket['title']} {ticket['issue']}"
-            try:
-                query_embedding = embedding_model.encode([search_query], convert_to_numpy=True)
-                query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=1, keepdims=True)
-                distances, indices = index.search(query_embedding, k=5)
-                similar_tickets = [
-                    {
-                        "ticket": metadata[idx],
-                        "similarity_score": float(distances[0][i])
-                    }
-                    for i, idx in enumerate(indices[0]) if idx < len(metadata) and distances[0][i] > 0.5
-                ]
-                summarized_resolution = ticket_analyzer.summarize_resolutions([t["ticket"] for t in similar_tickets])
-
-                if not similar_tickets:
-                    state["awaiting_no_similarity_confirmation"] = True
-                    save_conversation_state()
-                    return {
-                        "response": "Thanks for explaining. I couldn’t find any similar issues. Would you like me to create a JIRA ticket for this?",
-                        "ticket": ticket,
-                        "status": "awaiting_confirmation"
-                    }
-                else:
-                    state["awaiting_ticket_confirmation"] = True
-                    save_conversation_state()
-                    return {
-                        "response": (
-                            f"Found {len(similar_tickets)} similar tickets:\n"
-                            f"Top match: {similar_tickets[0]['ticket']['title']} (Score: {similar_tickets[0]['similarity_score']:.2f})\n"
-                            f"Resolution: {summarized_resolution}\n"
-                            f"Do you want to proceed with creating a new Jira ticket?"
-                        ),
-                        "similar_tickets": similar_tickets,
-                        "summarized_resolution": summarized_resolution,
-                        "ticket": ticket
-                    }
-            except Exception as e:
-                logger.error(f"Unexpected error during similarity search: {str(e)}")
-                state["awaiting_no_similarity_confirmation"] = True
-                save_conversation_state()
-                return {
-                    "response": "Thanks for explaining. I couldn’t find any similar issues. Would you like me to create a JIRA ticket for this?",
-                    "ticket": ticket,
-                    "status": "awaiting_confirmation"
-                }
-        elif user_input_lower in ["yes", "y"]:
-            state["awaiting_upload_confirmation"] = True
-            save_conversation_state()
-            return {"response": "Great! Please upload your files using POST /upload. Let me know when you're done."}
-        else:
-            return {"response": "Please say 'yes' to upload or 'no' to skip attachments."}
-
-    # Fallback to Mistral for unexpected cases
+    # --- MISTRAL LLM HANDLING ---
     prompt = build_prompt(state)
     try:
         response = ollama.chat(
             model="mistral",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "system", "content": "You are a helpful assistant. Respond naturally."},
                 {"role": "user", "content": prompt}
             ],
             options={"temperature": 0.4}
         )
         response_text = response["message"]["content"].strip()
         state["context_history"].append({"role": "assistant", "content": response_text})
+
+        # -- Check for JSON ticket --
+        match = re.search(r"{.*}", response_text, re.DOTALL)
+        if match:
+            try:
+                ticket_data = json.loads(match.group())
+                ticket_data["id"] = f"TICKET-{hash(conversation_id) % 10000:04}"
+                ticket_data["description"] = ticket_data.get("issue", "")
+                state["finalized_ticket"] = ticket_data
+
+                analysis = ticket_analyzer.analyze_ticket(ticket_data)
+                if analysis["status"] != "success":
+                    state["awaiting_validation_fix"] = True
+                    guidance = ticket_analyzer.generate_guidance(analysis)
+                    return {
+                        "response": f"Ticket validation failed:\n" + "\n".join(guidance["guidance"]),
+                        "status": "needs_fix"
+                    }
+
+                state["awaiting_ticket_confirmation"] = True
+                save_conversation_state()
+                return {
+                    "response": "Would you like to raise this ticket?",
+                    "ticket": ticket_data,
+                    "status": "awaiting_confirmation"
+                }
+            except json.JSONDecodeError:
+                logger.warning("Invalid JSON in LLM output")
+
+        # --- Ticket confirmation (yes/no) ---
+        if state["awaiting_ticket_confirmation"]:
+            if user_input_clean in ["yes", "y", "create"]:
+                state["awaiting_ticket_confirmation"] = False
+                state["awaiting_attachment"] = True
+                save_conversation_state()
+                return {
+                    "response": "Would you like to upload a screenshot, PDF, or link related to the issue? (yes/no)"
+                }
+
+            elif user_input_clean in ["no", "n"]:
+                reset_ticket(state)
+                return {"response": "Okay, ticket creation cancelled."}
+            else:
+                return {"response": "Please say 'yes' to raise the ticket or 'no' to cancel."}
+
+        # --- Optional attachment handling ---
+        if state["awaiting_attachment"]:
+            if user_input_clean in ["no", "n"]:
+                try:
+                    jira_response = create_jira_ticket(state["finalized_ticket"])
+                    state["jira_response"] = jira_response
+                    reset_ticket(state)
+                    return {
+                        "response": "Ticket created. Thank you.",
+                        "status": "created",
+                        "jira": jira_response
+                    }
+                except HTTPException as e:
+                    return {
+                        "response": f"Failed to create Jira ticket: {str(e.detail)}",
+                        "error": str(e.detail),
+                        "status": "error"
+                    }
+
+            elif user_input_clean in ["yes", "y"]:
+                state["awaiting_attachment"] = False
+                state["awaiting_upload_confirmation"] = True
+                save_conversation_state()
+                return {"response": "Great! Please upload the file now. Once done, type 'done' to continue."}
+            else:
+                return {"response": "Please reply with 'yes' to upload or 'no' to skip attachment."}
+
+        # --- Final confirmation after file upload ---
+        if state["awaiting_upload_confirmation"]:
+            if user_input_clean in ["done", "yes"]:
+                try:
+                    jira_response = create_jira_ticket(state["finalized_ticket"])
+                    state["jira_response"] = jira_response
+                    reset_ticket(state)
+                    return {
+                        "response": "Ticket created. Thank you.",
+                        "status": "created",
+                        "jira": jira_response
+                    }
+                except HTTPException as e:
+                    return {
+                        "response": f"Failed to create Jira ticket: {str(e.detail)}",
+                        "error": str(e.detail),
+                        "status": "error"
+                    }
+            else:
+                return {"response": "Let me know once you're done uploading."}
+
+        # -- Final fallback if none of the above --
         save_conversation_state()
         return {"response": response_text}
+
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Mistral error: {str(e)}")
+        return {"error": f"Mistral failed: {str(e)}"}
+
+
 
 # API Endpoints
 @app.get("/chat")
@@ -865,12 +658,19 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
     url = f"/{UPLOAD_DIR}/{filename}"
     state["pending_fields"]["attachments"].append(url)
+    if state["finalized_ticket"]:
+        state["finalized_ticket"]["attachments"] = state["pending_fields"]["attachments"]
+
+    # ✅ Mark that upload has happened and we can ask for "done" confirmation
+    state["awaiting_upload_confirmation"] = True
     save_conversation_state()
+
     return JSONResponse({
-        "message": "File uploaded. Let me know in chat when you're done uploading all files.",
+        "message": "File uploaded successfully. Type 'done' or 'yes' in chat when you're ready to continue.",
         "file_url": url,
         "conversation_id": conversation_id
     })
+
 
 # Exception handler
 @app.exception_handler(Exception)
