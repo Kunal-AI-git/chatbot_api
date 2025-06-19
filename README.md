@@ -1,34 +1,42 @@
-## 🤖 AI Chatbot for JIRA Ticketing
-This project is a smart conversational assistant built with FastAPI that helps users report issues, checks for similar historical tickets using FAISS, and creates JIRA tickets automatically. It supports file uploads, field validation, and multi-turn conversation with memory.
+# 🤖 Chatbot API with JIRA Integration
+
+This project is a FastAPI-based smart assistant that:
+- Responds to user issues conversationally
+- Checks similarity with past tickets (via FAISS)
+- Validates ticket quality and fields
+- Creates JIRA tickets (with attachments)
+- Uses an LLM (Mistral via Ollama) for natural dialogue
+
+---
 
 ## 🚀 Features
-🔍 FAISS-powered Similarity Search to detect duplicate issues
 
-🧠 Mistral model via Ollama for natural dialogue generation
+- 💬 Conversational flow using Mistral + FAISS
+- 🧠 NLP-based ticket analysis with spaCy
+- 🧾 JIRA ticket creation with priority/component inference
+- 📎 Attachment upload support
+- 🧠 Session-based memory & validation
+- 🗃️ Auto-saves conversation history & states
 
-🛠️ Auto-field inference: Component, Issue Type, Priority
+---
 
-📁 Attachment support via /upload endpoint
+## 📦 Requirements
 
-✅ Ticket quality validation with field guidance
+Install dependencies:
 
-🧾 Automatic JIRA ticket creation with attachments
+```bash
+pip install -r requirements.txt
+Make sure to download the spaCy model:
 
-💬 Session-based memory for natural back-and-forth chat
-
-🧠 Semantic summarization of resolutions using spaCy
-
-## 📂 Project Structure
 bash
 
-chatbot_api.py            # Main FastAPI application
-ticket_index.faiss        # FAISS index of previous ticket embeddings
-ticket_metadata.pkl       # Metadata associated with indexed tickets
-uploads/                  # Directory for user-uploaded files
-.env                      # Environment variables for JIRA
+python -m spacy download en_core_web_sm
 
-## ⚙️ Environment Variables (.env)
-ini
+## 🔐 .env Configuration
+Create a .env file with the following:
+
+env
+
 JIRA_DOMAIN=your-domain.atlassian.net
 JIRA_EMAIL=your-email@example.com
 JIRA_API_TOKEN=your-api-token
@@ -36,73 +44,54 @@ JIRA_PROJECT_KEY=PROJ
 JIRA_ISSUE_TYPE=Task
 SESSION_SECRET_KEY=your-random-secret-key
 
-## 🧪 Setup & Run
-1. Start Ollama (Mistral model)
+## 🧠 Preload FAISS Index (Optional)
+If you want similar ticket suggestions:
+
+Store ticket metadata in ticket_metadata.pkl
+
+Build FAISS index and save it as ticket_index.faiss
+
+## 🛠 Run the App
 bash
+uvicorn chatbot_api:app --reload
+The API will be available at:
+📍 http://127.0.0.1:8000
 
-ollama run mistral
+## 📂 Endpoints
+Method	Endpoint	Description
+GET	/chat	Start or continue chat session
+POST	/upload	Upload attachment for the ticket
 
-2. Launch API Server
-bash
+## 📁 Upload Directory
+Uploaded files are stored in the /uploads/ folder and used as attachments when creating JIRA tickets.
 
-uvicorn chatbot_api:app --reload --port 8000
+## ✅ Flow Summary
+User chats with assistant
 
-## 🔄 API Endpoints
+Bot checks for similar issues using FAISS
 
-/chat - Chat Interface
-GET /chat?user_input=your+message
+If unresolved, collects details → validates → formats JSON
 
-Responds to the user input and handles conversation context, field extraction, and ticket creation logic.
+Asks user to confirm and upload file
 
-## 📎 /upload - File Upload
-POST /upload
-Body: multipart/form-data with key file
+Sends issue to JIRA and confirms ticket creation
 
-Uploads attachments (images, PDFs, etc.) linked to the current conversation's ticket.
+## 🧪 Example Input
+text
+I’m unable to login to the dashboard. I enter my credentials, but nothing happens.
+→ Assistant will extract issue
+→ Ask for confirmation
+→ Then create a JIRA ticket with file attachment.
 
-## 📦 Sample Request Flow
-http
+## 👨‍💻 Credits
+Developed by Kunal J — powered by:
 
-GET /chat?user_input=hi
-→ "Hi! How can I assist you today?"
+🧠 Ollama + Mistral
 
-GET /chat?user_input=The login page is broken on mobile
-→ Searches for similar issues
+🧮 FAISS
 
-GET /chat?user_input=no
-→ Proceeds to create new ticket
+🌐 FastAPI
 
-GET /chat?user_input=high
-→ Sets priority
+📌 JIRA Cloud API
 
-GET /chat?user_input=yes
-→ Prompt to upload files via /upload
-
-POST /upload
-→ Upload attachment
-
-GET /chat?user_input=done
-→ Finalizes and creates ticket
-
-## ✅ Example Ticket Output
-json
-
-{
-  "title": "Dockerfile build fails with permission denied",
-  "issue": "Dockerfile build fails with permission denied during apt-get",
-  "priority": "Low",
-  "component": "Backend",
-  "issuetype": "Bug",
-  "attachments": ["/uploads/example.png"]
-}
-
-## 🧠 How It Works
-Ollama Mistral generates natural responses and extracts missing fields
-
-FAISS checks for semantically similar tickets
-
-TicketAnalysisAgent validates the ticket before submission
-
-Attachments are uploaded first, then finalized via user confirmation
-
-JIRA Integration uses the official Python SDK
+🔍 spaCy NLP
