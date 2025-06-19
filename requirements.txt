@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+requests
+python-dotenv
+sentence-transformers
+faiss-cpu
+spacy
+pydantic
+httpx
+python-multipart
